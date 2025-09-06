@@ -2,15 +2,11 @@
 
 Build and package Civil Infrastructure Platform (CIP) Super Long Term Support kernels on Arch based systems, then register them using kernel-install and Boot Loader Specification entries (BLS). This script helps you pick an active CIP branch, compiles it efficiently, creates Arch packages, and installs a boot menu entry titled "Arch Linux (CIP)".
 
-> Works on Arch Linux and Arch derivatives like EndeavourOS. Do not run the script as root, the script will use sudo only for system changes.
-
 <p align="center">
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/License-MIT-green.svg"></a>
   <img alt="Arch" src="https://img.shields.io/badge/Arch-yes-blue.svg">
   <img alt="PRs welcome" src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg">
 </p>
-
-*(Optional) Add a short asciinema or GIF that shows the branch table and selection prompt.*
 
 ---
 
