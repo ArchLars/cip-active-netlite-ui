@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # cip-active-netlite-ui-optimized.sh
-# Optimized CIP kernel build script with ccache, persistent builds, and update support
-# Pick a CIP branch, then clone/update, build, package with makepkg, and register via kernel-install
+# Optimized CIP kernel build script with ccache, persistent builds, and automatic updater+hook installation
+# Pick a CIP branch, then clone or update, build, package with makepkg, and register via kernel-install
 set -euo pipefail
 
 # Configuration
@@ -17,10 +17,14 @@ BUILD_CACHE_DIR="${BUILD_CACHE_DIR:-${HOME}/.cache/cip-builds}"
 CONFIG_CACHE_DIR="${CONFIG_CACHE_DIR:-${HOME}/.config/cip-kernel}"
 LSMOD_PROFILES_DIR="${LSMOD_PROFILES_DIR:-${CONFIG_CACHE_DIR}/profiles}"
 USE_CCACHE="${USE_CCACHE:-1}"
-USE_NINJA="${USE_NINJA:-0}"  # Experimental
 USE_LOCALMODCONFIG="${USE_LOCALMODCONFIG:-1}"
 INCREMENTAL_BUILD="${INCREMENTAL_BUILD:-1}"
 DEBUG_SYMBOLS="${DEBUG_SYMBOLS:-0}"
+
+# Paths used by the auto-updater this script installs
+UPDATER_BIN="/usr/local/bin/cip-kernel-autoupdate"
+UPDATER_CONF="/etc/cip-kernel-updater.conf"
+UPDATER_HOOK="/etc/pacman.d/hooks/90-cip-kernel-autoupdate.hook"
 
 # Create necessary directories
 mkdir -p "$CCACHE_DIR" "$BUILD_CACHE_DIR" "$CONFIG_CACHE_DIR" "$LSMOD_PROFILES_DIR"
@@ -145,29 +149,10 @@ branch_head_epoch() {
 
 fmt_days_ago() { local d="$1"; ((d<=0)) && echo "today" || { ((d==1)) && echo "1 day ago" || echo "$d days ago"; }; }
 
-# Check if build exists for branch
-check_existing_build() {
-  local branch="$1"
-  local build_dir="${BUILD_CACHE_DIR}/${branch//\//_}"
-  local state_file="${build_dir}/.build_state"
-  
-  if [[ -f "$state_file" ]]; then
-    source "$state_file"
-    echo "${GREEN}Found existing build:${RESET}"
-    echo "  Branch: $LAST_BRANCH"
-    echo "  Version: $LAST_VERSION"
-    echo "  Commit: $LAST_COMMIT"
-    echo "  Built: $LAST_BUILD_DATE"
-    return 0
-  fi
-  return 1
-}
-
 # Save build state
 save_build_state() {
   local branch="$1" version="$2" commit="$3" build_dir="$4"
   local state_file="${build_dir}/.build_state"
-  
   cat > "$state_file" <<EOF
 LAST_BRANCH="$branch"
 LAST_VERSION="$version"
@@ -180,7 +165,6 @@ EOF
 # Optimized kernel config
 optimize_kernel_config() {
   local config_file="$1"
-  
   if [[ "$DEBUG_SYMBOLS" == "0" ]]; then
     echo "${BLUE}Disabling debug symbols for smaller builds...${RESET}"
     ./scripts/config --file "$config_file" \
@@ -190,16 +174,16 @@ optimize_kernel_config() {
       -d DEBUG_INFO_DWARF5 \
       -e CONFIG_DEBUG_INFO_NONE || true
   fi
-  
-  # Disable IKHEADERS to prevent constant regeneration
-  ./scripts/config --file "$config_file" \
-    -d IKHEADERS \
-    -d IKHEADERS_PROC || true
-  
-  # Enable compression for modules
-  ./scripts/config --file "$config_file" \
-    -e MODULE_COMPRESS_GZIP || true
+  ./scripts/config --file "$config_file" -d IKHEADERS -d IKHEADERS_PROC || true
+  ./scripts/config --file "$config_file" -e MODULE_COMPRESS_GZIP || true
 }
+
+# Parse args
+CHOICE_FROM_ARG=""
+if [[ "${1:-}" == "--branch" && -n "${2:-}" ]]; then
+  CHOICE_FROM_ARG="$2"
+  shift 2
+fi
 
 # Main branch discovery
 REFS_HTML="$(curlq "$BASE/+refs")"
@@ -243,35 +227,26 @@ if need_cmd column; then out="$(printf "%s\n" "$out" | column -t -s $'\t')"; els
 [[ -n "${GREEN}${RED}${RESET}" ]] && out="$(printf "%s\n" "$out" | sed -E "1! s/ACTIVE/${GREEN}&${RESET}/g; 1! s/STALE/${RED}&${RESET}/g")"
 printf "%s\n" "$out"
 
-if ((${#ACTIVE[@]}==0)); then echo; echo "No ACTIVE branches under the current threshold ($THRESHOLD_DAYS days)."; exit 0; fi
-
-# Check for update mode
-if [[ "${1:-}" == "--update" ]] || [[ "${1:-}" == "-u" ]]; then
-  echo
-  echo "${BLUE}Update mode: Checking for existing builds...${RESET}"
-  found_build=0
-  for br in "${ACTIVE[@]}"; do
-    if check_existing_build "$br"; then
-      choice="$br"
-      found_build=1
-      break
-    fi
-  done
-  
-  if [[ "$found_build" == "0" ]]; then
-    echo "${YELLOW}No existing builds found. Please run initial build first.${RESET}"
-    exit 1
+# Choose branch
+choice=""
+if [[ -n "$CHOICE_FROM_ARG" ]]; then
+  # Non-interactive choice passed by updater
+  for b in "${ACTIVE[@]}"; do [[ "$b" == "$CHOICE_FROM_ARG" ]] && choice="$b" && break; done
+  if [[ -z "$choice" ]]; then
+    # fallback to any branch match, even if marked STALE
+    for b in "${BRANCHES[@]}"; do [[ "$b" == "$CHOICE_FROM_ARG" ]] && choice="$b" && break; done
   fi
+  [[ -z "$choice" ]] && { echo "Branch $CHOICE_FROM_ARG not found"; exit 1; }
+  echo "Selected by argument: $choice"
 else
+  if ((${#ACTIVE[@]}==0)); then echo; echo "No ACTIVE branches under the current threshold ($THRESHOLD_DAYS days)."; exit 0; fi
   echo; echo "Pick an ACTIVE branch:"
-  choice=""
   ACTIVE_LIST_SORTED="$(printf "%s\n" "${ACTIVE_SORTABLE[@]}" | sort -t $'\t' -k1,1nr -k2,2 | cut -f2-)"
   if need_cmd fzf; then choice="$(printf "%s\n" "$ACTIVE_LIST_SORTED" | fzf --prompt="SLTS> " --height=10 --reverse)" || true
   else PS3="Select branch> "; ACTIVE_ARR=( $(printf "%s\n" "$ACTIVE_LIST_SORTED") ); select br in "${ACTIVE_ARR[@]}"; do choice="$br"; break; done; fi
-  [[ -n "${choice:-}" ]] && echo "You selected: $choice"
+  [[ -z "${choice:-}" ]] && exit 0
+  echo "You selected: $choice"
 fi
-
-[[ -z "${choice:-}" ]] && exit 0
 
 ############################################
 # Build, package, install, kernel-install
@@ -294,7 +269,6 @@ fi
 # Tooling
 require_tools=(git make gcc awk sed grep tar xz zstd bc perl bison flex openssl pahole ld dtc rsync cpio strip makepkg fakeroot kernel-install mkinitcpio base64)
 [[ "$USE_CCACHE" == "1" ]] && require_tools+=(ccache)
-[[ "$USE_NINJA" == "1" ]] && require_tools+=(ninja python3)
 missing=(); for t in "${require_tools[@]}"; do need_cmd "$t" || missing+=("$t"); done
 if ((${#missing[@]})); then echo "Missing required tools: ${missing[*]}"; echo "Install base-devel and the listed tools, then rerun."; exit 1; fi
 (( EUID == 0 )) && { echo "Do not run as root. We use sudo only for system steps."; exit 1; }
@@ -367,11 +341,12 @@ WORKDIR="cip-build-$BR_SAFE"
 mkdir -p "$WORKDIR" "$BUILD_DIR"
 cd "$WORKDIR"
 
-# Check if this is an update or fresh build
+# Determine if incremental build is possible
 IS_UPDATE=0
 if [[ -d "${BUILD_DIR}/linux-cip" ]] && [[ -f "${BUILD_DIR}/.build_state" ]]; then
   echo "${GREEN}Found existing build directory. Performing incremental update...${RESET}"
   IS_UPDATE=1
+  # shellcheck source=/dev/null
   source "${BUILD_DIR}/.build_state"
 fi
 
@@ -408,7 +383,6 @@ post_upgrade() {
     echo "kernel-install add ${knew}"
     kernel-install add "${knew}" "/usr/lib/modules/${knew}/vmlinuz" || true
   fi
-  # remove older entries of the same flavor
   local k
   for k in $(_find_all_kvers_for_pkgbase); do
     [ "$k" = "$knew" ] && continue
@@ -439,7 +413,7 @@ _ensure_plugin_and_conf() {
 }
 INST
 
-# Title plugin shipped in the package for reuse (keeps generic title)
+# Title plugin shipped in the package
 cat > 95-cip-title.install <<'PLUG'
 #!/bin/sh
 set -eu
@@ -477,7 +451,6 @@ _use_ccache=@USE_CCACHE@
 _use_localmodconfig=@USE_LOCALMODCONFIG@
 _cc_prefix='@CC_PREFIX@'
 
-# Use deterministic timestamp for ccache
 export KBUILD_BUILD_TIMESTAMP=""
 export KBUILD_BUILD_USER="cip"
 export KBUILD_BUILD_HOST="archlinux"
@@ -492,7 +465,7 @@ prepare() {
   else
     if [[ -d "${_builddir}/linux-cip" ]]; then
       rm -rf "${_builddir}/linux-cip"
-    fi
+    fi>
     cd "${_builddir}"
     echo "Cloning fresh repository..."
     git clone --depth 1 --branch "${_branch}" \
@@ -500,10 +473,8 @@ prepare() {
     cd linux-cip
   fi
 
-  # Keep LOCALVERSION empty so kernelrelease stays clean
   echo "" > .scmversion
 
-  # Configuration strategy
   if [[ -f "${_builddir}/.config.saved" ]] && [[ $_is_update -eq 1 ]]; then
     echo "Using saved config from previous build..."
     cp "${_builddir}/.config.saved" .config
@@ -534,16 +505,13 @@ prepare() {
     make olddefconfig
   fi
 
-  # Optimize config
   @OPTIMIZE_CONFIG@
 
-  # Save config for future updates
   cp .config "${_builddir}/.config.saved"
 }
 
 pkgver() {
   cd "${_builddir}/linux-cip"
-  # Prefer CIP tags, then stable tags, else kernelversion + revcount + hash
   local desc=""
   desc="$(git describe --tags --match 'v[0-9]*.[0-9]*.[0-9]*-cip*' --long 2>/dev/null || true)"
   if [[ -z "$desc" ]]; then
@@ -552,7 +520,7 @@ pkgver() {
   if [[ -n "$desc" ]]; then
     desc="${desc#v}"
     IFS='-' read -r tag commits ghash <<<"$desc"
-    tag="${tag//-/.}"  # hyphens not allowed in pkgver
+    tag="${tag//-/.}"
     if [[ "$commits" == "0" ]]; then
       printf '%s\n' "$tag"
     else
@@ -568,14 +536,10 @@ pkgver() {
 
 build() {
   cd "${_builddir}/linux-cip"
-  
-  # Set up build environment
   if [[ $_use_ccache -eq 1 ]]; then
     export CC="${_cc_prefix}gcc"
     export HOSTCC="${_cc_prefix}gcc"
   fi
-  
-  # Incremental or clean build
   if [[ $_is_update -eq 1 ]] && [[ -f "${_builddir}/.build_complete" ]]; then
     echo "Performing incremental build..."
     make -j"$(nproc)" LOCALVERSION= bzImage modules
@@ -585,10 +549,7 @@ build() {
     make -j"$(nproc)" LOCALVERSION= bzImage modules
     touch "${_builddir}/.build_complete"
   fi
-  
   make -s LOCALVERSION= kernelrelease > "${_builddir}/.kver"
-  
-  # Save build state
   local kver=$(cat "${_builddir}/.kver")
   local commit=$(git rev-parse HEAD)
   cat > "${_builddir}/.build_state" <<EOF
@@ -604,7 +565,6 @@ _package_common_files() {
   local dest="$1"
   local kver; kver="$(<"${_builddir}/.kver")"
   cd "${_builddir}/linux-cip"
-  
   make LOCALVERSION= INSTALL_MOD_PATH="${dest}/usr" INSTALL_MOD_STRIP=1 modules_install
   install -Dm644 "arch/x86/boot/bzImage" "${dest}/usr/lib/modules/${kver}/vmlinuz"
   install -Dm644 "System.map"           "${dest}/usr/lib/modules/${kver}/System.map"
@@ -626,22 +586,14 @@ package_@PKGBASE@-headers() {
   depends=()
   local kver; kver="$(<"${_builddir}/.kver")"
   local builddir="${pkgdir}/usr/lib/modules/${kver}/build"
-  
   cd "${_builddir}/linux-cip"
-  
   install -dm755 "${builddir}"
   install -m644 {Makefile,Kconfig,Module.symvers,System.map,.config} "${builddir}/" || true
   cp -a {scripts,tools,include,arch} "${builddir}/"
-  
-  # Architecture specific files
   find "${builddir}/arch" -mindepth 1 -maxdepth 1 ! -name x86 -exec rm -rf {} +
-  
-  # Clean up build files
   find "${builddir}" -type f -name "*.o" -delete
   find "${builddir}" -type f -name "*.cmd" -delete
-  
   make LOCALVERSION= INSTALL_HDR_PATH="${builddir}/usr" headers_install
-  
   install -dm755 "${pkgdir}/usr/src"
   ln -s "../lib/modules/${kver}/build" "${pkgdir}/usr/src/${pkgbase}"
 }
@@ -680,13 +632,9 @@ fi
 
 echo
 echo "Building packages with makepkg..."
-
-# Clean build, install deps, no prompts
 if [[ "$IS_UPDATE" == "1" ]]; then
-  # For updates, skip cleaning source
   makepkg -se --noconfirm --needed
 else
-  # For fresh builds, do full clean
   makepkg -sCc --noconfirm
 fi
 
@@ -696,7 +644,6 @@ if [[ "$USE_CCACHE" == "1" ]]; then
   ccache -s | grep -E "cache hit rate|cache size|files in cache"
 fi
 
-# Install both packages
 PKGS=( $(ls -1 *.pkg.tar.* | sort) )
 echo
 echo "Installing packages with pacman..."
@@ -707,20 +654,154 @@ echo "${GREEN}Done!${RESET}"
 echo "kernel-install should have created a BLS entry titled: Arch Linux (CIP)"
 echo "Packages installed: ${PKGBASE} and ${PKGBASE}-headers"
 echo
-echo "${BLUE}Tips for next time:${RESET}"
-echo "  - Run with --update flag for incremental builds: $0 --update"
-echo "  - Save hardware profile: $0 --save-profile [name]"
-echo "  - Load hardware profile: $0 --load-profile [name]"
-echo "  - Merge multiple profiles: $0 --merge-profiles"
-echo
 echo "Check with: bootctl list && kernel-install inspect --verbose"
 
-# Create update script for convenience
-cat > update-cip-kernel.sh <<'UPDATE'
-#!/bin/bash
-# Quick update script for CIP kernels
-exec "$(dirname "$0")/cip-active-netlite-ui-optimized.sh" --update "$@"
-UPDATE
-chmod +x update-cip-kernel.sh
-echo
-echo "${BLUE}Created update-cip-kernel.sh for quick updates${RESET}"
+############################################
+# Install the auto-updater and pacman hook
+############################################
+install_updater() {
+  local self_path; self_path="$(readlink -f "$0")"
+  local owner; owner="$(id -un)"
+
+  echo "${BLUE}Installing CIP auto-updater and pacman hook...${RESET}"
+  # Config used by the updater
+  sudo install -Dm644 /dev/stdin "$UPDATER_CONF" <<EOF
+# cip-kernel auto-updater configuration
+OWNER="$owner"
+BUILDER="$self_path"
+CLONE_URL="$CLONE_URL"
+BUILD_CACHE_DIR="$BUILD_CACHE_DIR"
+CONFIG_CACHE_DIR="$CONFIG_CACHE_DIR"
+CCACHE_DIR="$CCACHE_DIR"
+EOF
+
+  # Updater binary
+  sudo install -Dm755 /dev/stdin "$UPDATER_BIN" <<'UPD'
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONF="/etc/cip-kernel-updater.conf"
+[[ -r "$CONF" ]] && source "$CONF"
+
+: "${CLONE_URL:=https://git.kernel.org/pub/scm/linux/kernel/git/cip/linux-cip.git}"
+: "${BUILD_CACHE_DIR:=/var/cache/cip-builds}"
+: "${CONFIG_CACHE_DIR:=/etc/cip-kernel}"
+: "${CCACHE_DIR:=/var/cache/ccache/cip}"
+: "${OWNER:=root}"
+: "${BUILDER:=/usr/local/bin/cip-builder-not-set}"
+
+STATE_DIR="/var/lib/cip-kernel"
+mkdir -p "$STATE_DIR"
+
+kver="$(uname -r)"
+moddir="/usr/lib/modules/${kver}"
+pkgbase_file="${moddir}/pkgbase"
+commit_file="${moddir}/source_commit"
+
+# Only act if running a CIP kernel
+if [[ ! -f "$pkgbase_file" ]]; then
+  exit 0
+fi
+pkgbase="$(cat "$pkgbase_file" 2>/dev/null || true)"
+case "$pkgbase" in
+  linux-cip|linux-cip-rt|linux-cip-rebase) ;;
+  *) exit 0 ;;
+esac
+
+suffix=""
+[[ "$pkgbase" == "linux-cip-rt" ]] && suffix="-rt"
+[[ "$pkgbase" == "linux-cip-rebase" ]] && suffix="-rebase"
+
+# Derive branch from running kernel version
+if [[ "$kver" =~ ^([0-9]+)\.([0-9]+)\. ]]; then
+  majmin="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+else
+  exit 0
+fi
+branch="linux-${majmin}.y-cip${suffix}"
+
+# Remote head SHA
+remote_sha="$(git ls-remote "$CLONE_URL" "refs/heads/${branch}" | awk '{print $1}')"
+if [[ -z "${remote_sha}" ]]; then
+  exit 0
+fi
+
+# Local commit SHA we are running
+local_sha=""
+if [[ -f "$commit_file" ]]; then
+  local_sha="$(cat "$commit_file" 2>/dev/null || true)"
+fi
+# If missing, try previous build state
+if [[ -z "$local_sha" ]]; then
+  br_safe="$(printf '%s' "$branch" | sed 's@[^A-Za-z0-9._-]@-@g')"
+  state="${BUILD_CACHE_DIR}/${br_safe}/.build_state"
+  [[ -r "$state" ]] && source "$state" || true
+  local_sha="${LAST_COMMIT:-}"
+fi
+
+# Skip if already up to date
+if [[ -n "$local_sha" && "$local_sha" == "$remote_sha" ]]; then
+  exit 0
+fi
+
+# Avoid immediate re-trigger after our own install
+stamp="${STATE_DIR}/last_${branch//\//_}.state"
+if [[ -f "$stamp" ]]; then
+  . "$stamp" || true
+  now=$(date +%s)
+  if [[ "${LAST_SHA:-}" == "$remote_sha" ]] && (( now - ${LAST_TIME:-0} < 86400 )); then
+    exit 0
+  fi
+fi
+
+# Wait for pacman DB lock to clear
+for i in {1..60}; do
+  [[ ! -e /var/lib/pacman/db.lck ]] && break
+  sleep 5
+done
+
+# Build as the recorded owner, never as root
+# Prepare env, prefer saved default hardware profile if present
+lsmod_profile="${CONFIG_CACHE_DIR}/profiles/default.modules"
+envs=(CCACHE_DIR="$CCACHE_DIR" BUILD_CACHE_DIR="$BUILD_CACHE_DIR" CONFIG_CACHE_DIR="$CONFIG_CACHE_DIR" USE_CCACHE=1 USE_LOCALMODCONFIG=1 DEBUG_SYMBOLS=0)
+if [[ -f "$lsmod_profile" ]]; then
+  envs+=(LSMOD="$lsmod_profile")
+fi
+
+if command -v sudo >/dev/null 2>&1; then
+  sudo -u "$OWNER" env "${envs[@]}" bash -lc "'$BUILDER' --branch '$branch'"
+else
+  su -s /bin/bash - "$OWNER" -c "env ${envs[*]} '$BUILDER' --branch '$branch'"
+fi
+
+# Record stamp
+date_epoch=$(date +%s)
+cat > "$stamp" <<EOF
+LAST_SHA="$remote_sha"
+LAST_TIME="$date_epoch"
+EOF
+
+exit 0
+UPD
+
+  # Pacman hook, runs after any transaction
+  sudo install -Dm644 /dev/stdin "$UPDATER_HOOK" <<'HOO'
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Operation = Remove
+Type = Package
+Target = *
+
+[Action]
+Description = CIP kernel auto-update check
+When = PostTransaction
+NeedsTargets = False
+Exec = /usr/local/bin/cip-kernel-autoupdate
+HOO
+
+  echo "${GREEN}Installed:${RESET} $UPDATER_BIN and $UPDATER_HOOK"
+  echo "Config: $UPDATER_CONF"
+}
+
+install_updater
