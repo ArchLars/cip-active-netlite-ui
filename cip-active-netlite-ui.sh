@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# cip-active-netlite-ui-v10.sh
+# cip-active-netlite-ui-v12.sh
 # Pick a CIP branch, then clone, build, package with makepkg, and register via kernel-install (mkinitcpio, BLS).
 set -euo pipefail
 
@@ -137,7 +137,7 @@ missing=(); for t in "${require_tools[@]}"; do need_cmd "$t" || missing+=("$t");
 if ((${#missing[@]})); then echo "Missing required tools: ${missing[*]}"; echo "Install base-devel and the listed tools, then rerun."; exit 1; fi
 (( EUID == 0 )) && { echo "Do not run as root. We use sudo only for system steps."; exit 1; }
 
-# Ensure kernel-install config and cmdline
+# Ensure kernel-install config and cmdline (BLS layout with mkinitcpio)
 ensure_kernel_install_conf() {
   sudo mkdir -p /etc
   if [[ ! -f /etc/kernel/install.conf ]]; then
@@ -180,60 +180,75 @@ ensure_kernel_install_conf
 ensure_cmdline
 install_cip_title_plugin
 
+# Determine flavor and pkgbase from the selected branch
+suffix=""
+if [[ "$choice" == *-rt* ]]; then
+  suffix="-rt"
+elif [[ "$choice" == *-rebase* ]]; then
+  suffix="-rebase"
+fi
+PKGBASE="linux-cip${suffix}"
+
 # Workspace
 BR_SAFE="$(printf '%s' "$choice" | sed 's@[^A-Za-z0-9._-]@-@g')"
 WORKDIR="cip-build-$BR_SAFE"
 mkdir -p "$WORKDIR"
 cd "$WORKDIR"
 
-# .install used by pacman to call kernel-install. It finds the kver from files owned by linux-cip.
-cat > linux-cip.install <<'INST'
-_find_kver_latest_for_pkg() {
-  # list files owned by installed linux-cip, find vmlinuz path, extract kver, pick highest by -V
-  pacman -Qql linux-cip 2>/dev/null \
-    | awk -F'/' '/^\/usr\/lib\/modules\/[^/]+\/vmlinuz$/ {print $5}' \
-    | sort -V | tail -n1
+# .install used by pacman to call kernel-install (generalized per flavor via $PKGBASE)
+cat > "${PKGBASE}.install" <<'INST'
+PKGBASE="@PKGBASE@"
+
+_find_all_kvers_for_pkgbase() {
+  for d in /usr/lib/modules/*; do
+    [ -d "$d" ] || continue
+    [ -f "$d/pkgbase" ] || continue
+    if [ "$(cat "$d/pkgbase")" = "$PKGBASE" ]; then
+      basename "$d"
+    fi
+  done | sort -V
 }
+
+_find_kver_latest_for_pkgbase() {
+  _find_all_kvers_for_pkgbase | tail -n1
+}
+
 post_install() {
-  local kver="$(_find_kver_latest_for_pkg)"
+  local kver="$(_find_kver_latest_for_pkgbase)"
   if [ -n "$kver" ]; then
     echo "kernel-install add ${kver}"
     kernel-install add "${kver}" "/usr/lib/modules/${kver}/vmlinuz" || true
   fi
   _ensure_plugin_and_conf
 }
+
 post_upgrade() {
-  local knew="$(_find_kver_latest_for_pkg)"
+  local knew="$(_find_kver_latest_for_pkgbase)"
   if [ -n "$knew" ]; then
     echo "kernel-install add ${knew}"
     kernel-install add "${knew}" "/usr/lib/modules/${knew}/vmlinuz" || true
   fi
-  # remove any other linux-cip entries still present
-  for d in /usr/lib/modules/*; do
-    [ -d "$d" ] || continue
-    [ -f "$d/pkgbase" ] || continue
-    [ "$(cat "$d/pkgbase")" = "linux-cip" ] || continue
-    local k="$(basename "$d")"
+  # remove older entries of the same flavor
+  local k
+  for k in $(_find_all_kvers_for_pkgbase); do
     [ "$k" = "$knew" ] && continue
     echo "kernel-install remove ${k}"
     kernel-install remove "$k" || true
   done
   _ensure_plugin_and_conf
 }
+
 post_remove() {
-  # remove any remaining entries for linux-cip
-  for d in /usr/lib/modules/*; do
-    [ -d "$d" ] || continue
-    [ -f "$d/pkgbase" ] || continue
-    [ "$(cat "$d/pkgbase")" = "linux-cip" ] || continue
-    local k="$(basename "$d")"
+  local k
+  for k in $(_find_all_kvers_for_pkgbase); do
     echo "kernel-install remove ${k}"
     kernel-install remove "$k" || true
   done
 }
+
 _ensure_plugin_and_conf() {
-  if [ ! -x /etc/kernel/install.d/95-cip-title.install ] && [ -x /usr/share/linux-cip/95-cip-title.install ]; then
-    install -Dm755 /usr/share/linux-cip/95-cip-title.install /etc/kernel/install.d/95-cip-title.install || true
+  if [ ! -x /etc/kernel/install.d/95-cip-title.install ] && [ -x "/usr/share/${PKGBASE}/95-cip-title.install" ]; then
+    install -Dm755 "/usr/share/${PKGBASE}/95-cip-title.install" /etc/kernel/install.d/95-cip-title.install || true
   fi
   if ! grep -qs '^layout=' /etc/kernel/install.conf 2>/dev/null; then
     printf 'layout=bls\n' | install -Dm644 /dev/stdin /etc/kernel/install.conf
@@ -244,7 +259,7 @@ _ensure_plugin_and_conf() {
 }
 INST
 
-# Title plugin shipped in the package for reuse
+# Title plugin shipped in the package for reuse (keeps generic title)
 cat > 95-cip-title.install <<'PLUG'
 #!/bin/sh
 set -eu
@@ -259,10 +274,10 @@ for f in "$entries_dir/${token}-${kver}"*.conf; do
 done
 PLUG
 
-# PKGBUILD with fixed pkgver() and split packages
+# PKGBUILD with flavor-aware pkgbase and split packages
 cat > PKGBUILD <<'PKG'
-pkgbase=linux-cip
-pkgname=(linux-cip linux-cip-headers)
+pkgbase=@PKGBASE@
+pkgname=(@PKGBASE@ @PKGBASE@-headers)
 pkgver=0
 pkgrel=1
 pkgdesc="Civil Infrastructure Platform kernel from the selected CIP branch, packaged for Arch"
@@ -272,7 +287,7 @@ license=(GPL2)
 makedepends=(git bc kmod libelf pahole perl python xz zstd dtc cpio rsync)
 options=('!debug')
 source=("linux-cip::git+https://git.kernel.org/pub/scm/linux/kernel/git/cip/linux-cip.git#branch=@BRANCH@"
-        "linux-cip.install"
+        "@PKGBASE@.install"
         "95-cip-title.install")
 b2sums=('SKIP' 'SKIP' 'SKIP')
 
@@ -280,7 +295,7 @@ _branch='@BRANCH@'
 
 prepare() {
   cd "${srcdir}/linux-cip"
-  scripts/setlocalversion --save-scmversion || true
+  # Keep LOCALVERSION empty so kernelrelease stays clean
   if zcat /proc/config.gz >/dev/null 2>&1; then
     zcat /proc/config.gz > .config
   else
@@ -291,43 +306,55 @@ prepare() {
 
 pkgver() {
   cd "${srcdir}/linux-cip"
-  (
-    set -o pipefail
-    git describe --tags --long 2>/dev/null \
-      | sed 's/^v//; s/\([^-]*-g\)/r\1/; s/-/./g' \
-      || printf "%s.r%s.g%s" \
-           "$(make -s kernelversion)" \
-           "$(git rev-list --count HEAD)" \
-           "$(git rev-parse --short HEAD)"
-  )
+  # Prefer CIP tags, then stable tags, else kernelversion + revcount + hash
+  local desc=""
+  desc="$(git describe --tags --match 'v[0-9]*.[0-9]*.[0-9]*-cip*' --long 2>/dev/null || true)"
+  if [[ -z "$desc" ]]; then
+    desc="$(git describe --tags --match 'v[0-9]*.[0-9]*.[0-9]*' --long 2>/dev/null || true)"
+  fi
+  if [[ -n "$desc" ]]; then
+    desc="${desc#v}"
+    IFS='-' read -r tag commits ghash <<<"$desc"
+    tag="${tag//-/.}"  # hyphens not allowed in pkgver
+    if [[ "$commits" == "0" ]]; then
+      printf '%s\n' "$tag"
+    else
+      printf '%s.r%s.%s\n' "$tag" "$commits" "${ghash/g/}"
+    fi
+  else
+    printf "%s.r%s.%s\n" \
+      "$(make -s kernelversion)" \
+      "$(git rev-list --count HEAD)" \
+      "$(git rev-parse --short HEAD)"
+  fi
 }
 
 build() {
   cd "${srcdir}/linux-cip"
-  make -j"$(nproc)" bzImage modules
-  # record the kernel release for packaging phases
-  make -s kernelrelease > "${srcdir}/.kver"
+  make -j"$(nproc)" LOCALVERSION= bzImage modules
+  make -s LOCALVERSION= kernelrelease > "${srcdir}/.kver"
 }
 
 _package_common_files() {
   local dest="$1"
   local kver; kver="$(<"${srcdir}/.kver")"
-  make -C "${srcdir}/linux-cip" INSTALL_MOD_PATH="${dest}/usr" INSTALL_MOD_STRIP=1 modules_install
+  make -C "${srcdir}/linux-cip" LOCALVERSION= INSTALL_MOD_PATH="${dest}/usr" INSTALL_MOD_STRIP=1 modules_install
   install -Dm644 "${srcdir}/linux-cip/arch/x86/boot/bzImage" "${dest}/usr/lib/modules/${kver}/vmlinuz"
   install -Dm644 "${srcdir}/linux-cip/System.map"           "${dest}/usr/lib/modules/${kver}/System.map"
   install -Dm644 "${srcdir}/linux-cip/.config"              "${dest}/usr/lib/modules/${kver}/config"
   echo "${pkgbase}" > "${dest}/usr/lib/modules/${kver}/pkgbase"
+  git -C "${srcdir}/linux-cip" rev-parse HEAD > "${dest}/usr/lib/modules/${kver}/source_commit"
 }
 
-package_linux-cip() {
+package_@PKGBASE@() {
   pkgdesc+=" (binary)"
   depends=(coreutils kmod)
-  install -Dm755 "95-cip-title.install"   "${pkgdir}/usr/share/linux-cip/95-cip-title.install"
+  install -Dm755 "95-cip-title.install"   "${pkgdir}/usr/share/${pkgbase}/95-cip-title.install"
   _package_common_files "${pkgdir}"
   install=${pkgbase}.install
 }
 
-package_linux-cip-headers() {
+package_@PKGBASE@-headers() {
   pkgdesc+=" (headers for building out-of-tree modules)"
   depends=()
   local kver; kver="$(<"${srcdir}/.kver")"
@@ -337,14 +364,15 @@ package_linux-cip-headers() {
   install -m644 "${srcdir}/linux-cip"/{Makefile,Kconfig,Module.symvers,System.map,.config} "${builddir}/" || true
   cp -a "${srcdir}/linux-cip"/{scripts,tools,include,arch,xz,lib} "${builddir}/"
   find "${builddir}/arch" -mindepth 1 -maxdepth 1 ! -name x86 -exec rm -rf {} +
-  make -C "${srcdir}/linux-cip" INSTALL_HDR_PATH="${builddir}/usr" headers_install
+  make -C "${srcdir}/linux-cip" LOCALVERSION= INSTALL_HDR_PATH="${builddir}/usr" headers_install
   install -dm755 "${pkgdir}/usr/src"
   ln -s "../lib/modules/${kver}/build" "${pkgdir}/usr/src/${pkgbase}"
 }
 PKG
 
-# Fill in chosen branch
+# Fill in chosen branch and pkgbase
 sed -i "s|@BRANCH@|$choice|g" PKGBUILD
+sed -i "s|@PKGBASE@|$PKGBASE|g" PKGBUILD "${PKGBASE}.install"
 
 echo
 echo "Build files written to: $(pwd)"
@@ -361,4 +389,5 @@ sudo pacman -U --noconfirm --needed "${PKGS[@]}"
 
 echo
 echo "Done. kernel-install should have created a BLS entry titled: Arch Linux (CIP)"
+echo "Packages installed: ${PKGBASE} and ${PKGBASE}-headers"
 echo "Check with:  bootctl list   and   kernel-install inspect --verbose"
