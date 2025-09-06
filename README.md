@@ -59,33 +59,10 @@ sudo pacman -S --needed base-devel git ccache pahole dtc rsync cpio mkinitcpio s
 
 ## Installation
 
-Option A, recommended for transparency:
 
 ```bash
 git clone https://github.com/ArchLars/cip-active-netlite-ui
 cd cip-active-netlite-ui
-```
-
-Option B, quick try from a temp location (you can read the script first):
-
-```bash
-cd "$(mktemp -d)"
-curl -fsSLO https://raw.githubusercontent.com/ArchLars/cip-active-netlite-ui/HEAD/cip-active-netlite-ui-optimized.sh
-chmod +x cip-active-netlite-ui-optimized.sh
-```
-
----
-
-## Quick start
-
-```bash
-./cip-active-netlite-ui-optimized.sh
-# Pick an ACTIVE branch when prompted
-# Wait for build and packaging to finish
-# Packages are installed with pacman, kernel-install adds a BLS entry
-
-# Verify boot entries
-bootctl list
 ```
 
 Reboot when ready and select the "Arch Linux (CIP)" entry if your boot manager shows it.
