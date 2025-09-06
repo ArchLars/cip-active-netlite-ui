@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+set -euo pipefail
+CONF="/etc/cip-kernel-updater.conf"
+[[ -r "$CONF" ]] && source "$CONF"
+
+: "${CLONE_URL:=https://git.kernel.org/pub/scm/linux/kernel/git/cip/linux-cip.git}"
+: "${BUILD_CACHE_DIR:=/var/cache/cip-builds}"
+: "${CONFIG_CACHE_DIR:=/etc/cip-kernel}"
+: "${CCACHE_DIR:=/var/cache/ccache/cip}"
+: "${OWNER:=root}"
+: "${BUILDER:=/usr/local/bin/cip-builder-not-set}"
+
+STATE_DIR="/var/lib/cip-kernel"
+mkdir -p "$STATE_DIR"
+
+kver="$(uname -r)"
+moddir="/usr/lib/modules/${kver}"
+pkgbase_file="${moddir}/pkgbase"
+commit_file="${moddir}/source_commit"
+
+if [[ ! -f "$pkgbase_file" ]]; then exit 0; fi
+pkgbase="$(cat "$pkgbase_file" 2>/dev/null || true)"
+case "$pkgbase" in linux-cip|linux-cip-rt|linux-cip-rebase) ;; *) exit 0 ;; esac
+
+suffix=""
+[[ "$pkgbase" == "linux-cip-rt" ]] && suffix="-rt"
+[[ "$pkgbase" == "linux-cip-rebase" ]] && suffix="-rebase"
+
+if [[ "$kver" =~ ^([0-9]+)\.([0-9]+)\. ]]; then
+  majmin="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+else
+  exit 0
+fi
+branch="linux-${majmin}.y-cip${suffix}"
+
+remote_sha="$(git ls-remote "$CLONE_URL" "refs/heads/${branch}" | awk '{print $1}')"
+[[ -z "$remote_sha" ]] && exit 0
+
+local_sha=""
+[[ -f "$commit_file" ]] && local_sha="$(cat "$commit_file" 2>/dev/null || true)" || true
+if [[ -z "$local_sha" ]]; then
+  br_safe="$(printf '%s' "$branch" | sed 's@[^A-Za-z0-9._-]@-@g')"
+  state="${BUILD_CACHE_DIR}/${br_safe}/.build_state"
+  [[ -r "$state" ]] && source "$state" || true
+  local_sha="${LAST_COMMIT:-}"
+fi
+if [[ -n "$local_sha" && "$local_sha" == "$remote_sha" ]]; then exit 0; fi
+
+stamp="${STATE_DIR}/last_${branch//\//_}.state"
+if [[ -f "$stamp" ]]; then
+  . "$stamp" || true
+  now=$(date +%s)
+  if [[ "${LAST_SHA:-}" == "$remote_sha" ]] && (( now - ${LAST_TIME:-0} < 86400 )); then exit 0; fi
+fi
+
+for i in {1..60}; do
+  [[ ! -e /var/lib/pacman/db.lck ]] && break
+  sleep 5
+done
+
+lsmod_profile="${CONFIG_CACHE_DIR}/profiles/default.modules"
+envs=(CCACHE_DIR="$CCACHE_DIR" BUILD_CACHE_DIR="$BUILD_CACHE_DIR" CONFIG_CACHE_DIR="$CONFIG_CACHE_DIR" USE_CCACHE=1 USE_LOCALMODCONFIG=1 DEBUG_SYMBOLS=0)
+[[ -f "$lsmod_profile" ]] && envs+=(LSMOD="$lsmod_profile")
+
+if command -v sudo >/dev/null 2>&1; then
+  sudo -u "$OWNER" env "${envs[@]}" bash -lc "'$BUILDER' --branch '$branch'"
+else
+  su -s /bin/bash - "$OWNER" -c "env ${envs[*]} '$BUILDER' --branch '$branch'"
+fi
+
+date_epoch=$(date +%s)
+cat > "$stamp" <<EOF
+LAST_SHA="$remote_sha"
+LAST_TIME="$date_epoch"
+EOF
